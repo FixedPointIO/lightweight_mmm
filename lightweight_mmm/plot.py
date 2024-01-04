@@ -45,7 +45,7 @@ plt.rcParams['font.size'] = 8
 plt.rcParams["figure.dpi"] = 300
 plt.rcParams['errorbar.capsize'] = 5  # Setting the capsize for error bars
 
-_PALETTE = sns.color_palette(n_colors=100)
+_PALETTE = sns.color_palette('tab20', n_colors=100)
 
 
 @functools.partial(jax.jit, static_argnames=("media_mix_model"))
