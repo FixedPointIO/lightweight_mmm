@@ -37,10 +37,13 @@ from lightweight_mmm import models
 from lightweight_mmm import preprocessing
 from lightweight_mmm import utils
 
+import matplotlib.pyplot as plt
+
 plt.style.use("bmh")
 plt.rcParams["figure.figsize"] = [16, 8]
 plt.rcParams['font.size'] = 8
-plt.rcParams["figure.dpi"] = 100
+plt.rcParams["figure.dpi"] = 300
+plt.rcParams['errorbar.capsize'] = 5  # Setting the capsize for error bars
 
 _PALETTE = sns.color_palette(n_colors=100)
 
