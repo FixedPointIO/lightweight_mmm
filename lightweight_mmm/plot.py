@@ -37,7 +37,10 @@ from lightweight_mmm import models
 from lightweight_mmm import preprocessing
 from lightweight_mmm import utils
 
-plt.style.use("default")
+plt.style.use("bmh")
+plt.rcParams["figure.figsize"] = [16, 8]
+plt.rcParams['font.size'] = 8
+plt.rcParams["figure.dpi"] = 100
 
 _PALETTE = sns.color_palette(n_colors=100)
 
