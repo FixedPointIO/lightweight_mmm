@@ -40,12 +40,12 @@ from lightweight_mmm import utils
 import matplotlib.pyplot as plt
 
 plt.style.use("bmh")
-plt.rcParams["figure.figsize"] = [16, 8]
+plt.rcParams["figure.figsize"] = [14, 8]
 plt.rcParams['font.size'] = 8
 plt.rcParams["figure.dpi"] = 300
 plt.rcParams['errorbar.capsize'] = 5  # Setting the capsize for error bars
 
-_PALETTE = sns.color_palette('tab20', n_colors=100)
+_PALETTE = sns.color_palette('tab20')
 
 
 @functools.partial(jax.jit, static_argnames=("media_mix_model"))
