@@ -860,8 +860,8 @@ def plot_bars_media_metrics(
   sns.barplot(data=metric, ci=None, ax=ax)
   quantile_bounds = np.quantile(
       metric, q=[lower_quantile, upper_quantile], axis=0)
-  quantile_bounds[0] = metric.mean(axis=0) - quantile_bounds[0]
-  quantile_bounds[1] = quantile_bounds[1] - metric.mean(axis=0)
+  quantile_bounds[0] = abs(metric.mean(axis=0) - quantile_bounds[0])
+  quantile_bounds[1] = abs(quantile_bounds[1] - metric.mean(axis=0))
 
   ax.errorbar(
       x=np.arange(np.shape(metric)[1]),
