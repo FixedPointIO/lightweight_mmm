@@ -37,9 +37,10 @@ from lightweight_mmm import models
 from lightweight_mmm import preprocessing
 from lightweight_mmm import utils
 
-plt.style.use("default")
+plt.rcParams['font.size'] = 8
+plt.style.use('bmh')
 
-_PALETTE = sns.color_palette(n_colors=100)
+_PALETTE = sns.color_palette("pastel")
 
 
 @functools.partial(jax.jit, static_argnames=("media_mix_model"))
