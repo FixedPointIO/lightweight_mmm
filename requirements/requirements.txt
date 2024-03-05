@@ -1,19 +1,32 @@
+# Copyright 2023 Fastrak, Inc.
+# Copyright 2023 Google LLC.
+#
+# Adapted from the original lightweight_mmm source, available at
+# https://github.com/google/lightweight_mmm
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 absl-py
 arviz>=0.11.2
 immutabledict>=2.0.0
 jax>=0.3.18
 jaxlib>=0.3.18
-matplotlib==3.6.1
+matplotlib==3.7.2
 numpy>=1.23
 numpyro>=0.9.2
 pandas>=1.1.5
 scipy
-seaborn==0.11.1
+seaborn==0.12.2
 scikit-learn
 statsmodels>=0.13.0
 tensorflow>=2.7.2
-click==8.1.7
-GitPython==3.1.40
-msgpack==1.0.7
-msgpack-numpy==0.4.8
-PyYAML==6.0.1
