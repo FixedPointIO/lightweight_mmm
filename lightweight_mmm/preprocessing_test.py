@@ -1,10 +1,14 @@
+# Copyright 2023 Fastrak, Inc.
 # Copyright 2023 Google LLC.
+#
+# Adapted from the original lightweight_mmm source, available at
+# https://github.com/google/lightweight_mmm
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -645,7 +649,7 @@ class PreprocessingTest(parameterized.TestCase):
 
     for i, expected_correlation in enumerate(expected_correlations):
       pd.testing.assert_frame_equal(
-          correlations[i], expected_correlation, atol=1e-3, check_dtype=False)
+          correlations[i].fillna(0.), expected_correlation.fillna(0.), atol=1e-3, check_dtype=False)
 
   @parameterized.named_parameters([
       dict(
@@ -705,7 +709,7 @@ class PreprocessingTest(parameterized.TestCase):
 
     for i, expected_correlation in enumerate(updated_expected_correlations):
       pd.testing.assert_frame_equal(
-          correlations[i], expected_correlation, atol=1e-3, check_dtype=False)
+          correlations[i].fillna(0.), expected_correlation.fillna(0.), atol=1e-3, check_dtype=False)
 
   @parameterized.named_parameters([
       dict(

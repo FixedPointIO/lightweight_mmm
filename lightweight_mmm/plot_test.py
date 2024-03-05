@@ -1,10 +1,14 @@
+# Copyright 2023 Fastrak, Inc.
 # Copyright 2023 Google LLC.
+#
+# Adapted from the original lightweight_mmm source, available at
+# https://github.com/google/lightweight_mmm
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +28,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpyro.distributions as dist
 import pandas as pd
+
+from numpy.testing import assert_array_almost_equal
 
 from lightweight_mmm import lightweight_mmm
 from lightweight_mmm import models
@@ -235,6 +241,37 @@ class PlotTest(parameterized.TestCase):
           jnp.round(a=call_kwargs["x"].max().item(), decimals=4).item(),
           jnp.round(a=expected_max, decimals=4).item() * n_geos,
           places=4)
+
+  def test_response_curves_cost_model(self):
+    media = np.zeros(shape=(50, 5))
+    media_names = [f"Channel{i}" for i in range(5)]
+    with np.nditer(media, op_flags=['readwrite'], flags=['multi_index']) as it:
+      for x in it:
+        x[...] = (it.multi_index[0] + 1) * (it.multi_index[1] + 1)
+    costs_per_day = media * 10.
+    cost_models = plot._train_cost_models(media=media, costs_per_day=costs_per_day, names=media_names)
+    predicted_costs_per_day = plot._predict_costs_for_media_units(
+      media=media,
+      channel_axis=1,
+      cost_models=cost_models
+    )
+    assert_array_almost_equal(costs_per_day, predicted_costs_per_day, decimal=2)
+
+    # now again, with geo data
+    media = np.zeros(shape=(50, 5, 3))
+    with np.nditer(media, op_flags=['readwrite'], flags=['multi_index']) as it:
+      for x in it:
+        x[...] = (it.multi_index[0] + 1) * (it.multi_index[1] + 1) * (it.multi_index[2] + 1)
+    costs_per_day = media * 10.
+    cost_models = plot._train_cost_models(media=media, costs_per_day=costs_per_day, names=media_names)
+    predicted_costs_per_day = plot._predict_costs_for_media_units(
+      media=media,
+      channel_axis=1,
+      cost_models=cost_models
+    )
+    assert_array_almost_equal(costs_per_day, predicted_costs_per_day, decimal=2)
+
+
 
   @parameterized.named_parameters([
       dict(

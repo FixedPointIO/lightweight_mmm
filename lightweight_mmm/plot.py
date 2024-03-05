@@ -1,10 +1,14 @@
+# Copyright 2023 Fastrak, Inc.
 # Copyright 2023 Google LLC.
+#
+# Adapted from the original lightweight_mmm source, available at
+# https://github.com/google/lightweight_mmm
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,10 +41,9 @@ from lightweight_mmm import models
 from lightweight_mmm import preprocessing
 from lightweight_mmm import utils
 
-plt.rcParams['font.size'] = 8
-plt.style.use('bmh')
+plt.style.use("default")
 
-_PALETTE = sns.color_palette("pastel")
+_PALETTE = sns.color_palette(n_colors=100)
 
 
 @functools.partial(jax.jit, static_argnames=("media_mix_model"))
@@ -292,6 +295,13 @@ def create_media_baseline_contribution_df(
       axis=0)
 
   # Adjust baseline contribution and prediction when there's any negative value.
+  # In the case of a negative baseline, we ensure that the overall height of the curve matches the
+  # daily prediction (mu), while dividing the area under the curve among the media channels according to their
+  # relative contribution.  This results in a curve with the correct total height, but where the media contribution
+  # will be decreased to compensate for the negative baseline.  For this case,
+  # 'adjusted_sum_scaled_prediction_across_samples' will be higher than the actual predictions.  By scaling the
+  # actual contribution numbers (below) based on the daily prediction, we prevent this from impacting the overall
+  # height of the curve.
   adjusted_sum_scaled_baseline_contribution_across_samples = np.where(
       sum_scaled_baseline_contribution_across_samples < 0, 0,
       sum_scaled_baseline_contribution_across_samples)
@@ -365,6 +375,107 @@ def create_media_baseline_contribution_df(
   contribution_df.loc[:, "period"] = period
   return contribution_df
 
+def _train_cost_models(media, costs_per_day, names):
+    """Trains a simple polynomial model to translate media unit values to cost per unit values.
+
+    Args:
+      media: media units as an array [ time, channel, [geo] ]
+      costs_per_day: costs as an array [ time, channel, [geo] ]
+      names: array of channel names, in the event we need to show an error
+
+    Returns:
+      array of cost models, indexed by channel that can be used to translate media units to
+        costs.  When either of media units or costs is all zero for a channel, the corresponding
+        element of this array will be None.  These channels should be skipped over when plotting
+        response curves.
+    """
+    if media.ndim == 3:
+      media_input = np.sum(media, axis=2)
+      costs_input = np.sum(costs_per_day, axis=2)
+    else:
+      media_input = media
+      costs_input = costs_per_day
+
+    cost_models = []
+    for channel_idx in range(media_input.shape[1]):
+      # If either media values or cost values are all zero, do not build a model for this
+      # channel.  We will skip over this channel when plotting response curves
+      if not np.any(media_input[:, channel_idx]) or not np.any(costs_input[:, channel_idx]):
+        cost_models.append(None)
+      else:
+        try:
+          channel_impressions = media_input[:, channel_idx]
+          channel_costs = costs_input[:, channel_idx]
+
+          # 'model' has type numpy.polynomial.polynomial.Polynomial.
+          model = np.polynomial.polynomial.Polynomial.fit(
+            x=channel_impressions,
+            y=channel_costs,
+            deg=1,
+          )
+
+          # Sometimes the linear regression will have a negative slope (i.e. as impressions
+          # increases, we predict less cost).  This can happen, for example, if impressions spikes
+          # and spend stays the same or goes down.  This can create the appearance of a negative
+          # correlation between impressions and spend.  If this happens, we override the polynomial
+          # fit with a simple aggregate cost per impression calculation for this channel.
+          slope = model.convert().coef[1]
+          if slope <= 0.0:
+            # cost_per_impression is an unscaled value
+            cost_per_impression = channel_costs.sum() / channel_impressions.sum()
+            model_convert = model.convert()
+            # since we just want to multiply impressions by the CPM to get spend, we don't need
+            # to fit a model. Instead, we create a model by passing the coefficients of interest
+            # directly.
+            model = np.polynomial.Polynomial(
+              coef=[0, cost_per_impression],
+              domain=model_convert.domain,
+              window=model_convert.window,
+              symbol=model_convert.symbol
+            )
+
+          cost_models.append(model)
+        except np.linalg.LinAlgError as e:
+          raise Exception(
+            f'Unable to fit impressions-to-costs model for channel "{names[channel_idx]}"'
+          ) from e
+
+    return cost_models
+
+def _predict_costs_for_media_units(media, channel_axis, cost_models):
+  """Predict costs from media units and return a new array with the predictions.
+
+  Args:
+    media: array of media unit values
+    channel_axis: axis number of the 'media' array representing the channel.  Normally this is
+                  1 but for the average_allocation case we use a lower-dimensional array.
+    cost_models: array of cost models [channel]
+
+  Returns:
+    new array with cost values, in the same shape as the 'media' input array
+
+  """
+  # create a copy of the media unit values, which we will transform to costs in-place.
+  costs = np.copy(media)
+
+  # Iterate over each element of the array and update each element separately
+  with np.nditer(costs, op_flags=['readwrite'], flags=['multi_index']) as it:
+    for x in it:
+      # it.multi_index[channel_axis] evalutes to the index of the column or row we are on
+      # in this iteration, depending on whether channels are in columns (channel_axis=1) or
+      # rows (channel_axis = 0) in the input media array.  This is the same as the channel index,
+      # so we can use it to fetch the relevant cost model.
+      model = cost_models[it.multi_index[channel_axis]]
+      if model is not None:
+        predicted_cost = model(x)
+      else:
+        predicted_cost = 0.
+
+      # update this single element of the array to the prediction, replacing negative values with
+      # zero.
+      x[...] = predicted_cost if predicted_cost > 0. else 0.
+
+  return costs
 
 def plot_response_curves(# jax-ndarray
     media_mix_model: lightweight_mmm.LightweightMMM,
@@ -379,7 +490,9 @@ def plot_response_curves(# jax-ndarray
     n_columns: int = 3,
     marker_size: int = 8,
     legend_fontsize: int = 8,
-    seed: Optional[int] = None) -> matplotlib.figure.Figure:
+    seed: Optional[int] = None,
+    costs_per_day: jnp.ndarray = None,
+    response_metric: str = "target") -> matplotlib.figure.Figure:
   """Plots the response curves of each media channel based on the model.
 
   It plots an individual subplot for each media channel. If '
@@ -418,6 +531,14 @@ def plot_response_curves(# jax-ndarray
     seed: Seed to use for PRNGKey during sampling. For replicability run
       this function and any other function that gets predictions with the same
       seed.
+    costs_per_day: unscaled total spend values per media channel per day. Dimensions are
+      (day, channel, [geo])).  Without this data, this function assumes that the
+      average cost per media unit does not vary over the time period.  When provided,
+      this function fits a simple model to translate media units to spend values.
+      When passing this variable, do not pass a value for 'prices'.
+    response_metric: response metric to plot.  "target" for the target metric,
+      "cost_per_target" for cost per target metric value (e.g. cost per acquisition if
+      the target metric is acquisitions)
 
   Returns:
     Plots of response curves.
@@ -426,15 +547,46 @@ def plot_response_curves(# jax-ndarray
     raise lightweight_mmm.NotFittedModelError(
         "Model needs to be fit first before attempting to plot its response "
         "curves.")
+  if prices is not None and costs_per_day is not None:
+    raise ValueError("Prices and costs_per_day are mutually exclusive.")
+  if costs_per_day is not None and costs_per_day.shape != media_mix_model.media.shape:
+    raise ValueError("Costs per day should have the same shape as media.")
+  if costs_per_day is not None and media_scaler is None:
+    raise ValueError("When providing costs_per_day, you must also provide a media_scaler")
+  if response_metric not in ["target", "cost_per_target"]:
+    raise ValueError("Invalid response_metric")
+
   media = media_mix_model.media
+
+  if costs_per_day is not None:
+    cost_models = _train_cost_models(
+      media=media_scaler.inverse_transform(media) if media_scaler else media,
+      costs_per_day=costs_per_day,
+      names=media_mix_model.media_names,
+    )
+    # start the response curves at their actual min because the linear fit can show
+    # negative values for media units below the observed range
+    media_mins = media.min(axis=0)
+
+    # skip response curves for the channels for which we did not produce a cost model
+    should_skip_channel = [bool(model is None) for model in cost_models]
+  else:
+    cost_models = None
+    # start the response curves at zero for backwards compatibility
+    media_mins = 0
+
+    # do not skip any response curves
+    should_skip_channel = [False] * media_mix_model.n_media_channels
+
   media_maxes = media.max(axis=0) * (1 + percentage_add)
   if media_mix_model._extra_features is not None:
     extra_features = jnp.expand_dims(
         media_mix_model._extra_features.mean(axis=0), axis=0)
   else:
     extra_features = None
+
   media_ranges = jnp.expand_dims(
-      jnp.linspace(start=0, stop=media_maxes, num=steps), axis=0)
+      jnp.linspace(start=media_mins, stop=media_maxes, num=steps), axis=0)
 
   make_predictions = jax.vmap(
       jax.vmap(_make_single_prediction,
@@ -470,6 +622,12 @@ def plot_response_curves(# jax-ndarray
     if media.ndim == 3:
       prices = jnp.expand_dims(prices, axis=-1)
     media_ranges *= prices
+  elif cost_models is not None:
+    media_ranges = _predict_costs_for_media_units(
+      media=media_ranges,
+      channel_axis=1,
+      cost_models=cost_models
+    )
 
   if predictions.ndim == 3:
     media_ranges = jnp.sum(media_ranges, axis=-1)
@@ -498,12 +656,35 @@ def plot_response_curves(# jax-ndarray
     if prices is not None:
       optimal_allocation_per_timeunit *= prices
       average_allocation *= prices
+    elif cost_models is not None:
+      optimal_allocation_per_timeunit = _predict_costs_for_media_units(
+        media=optimal_allocation_per_timeunit,
+        channel_axis=1,
+        cost_models=cost_models
+      )
+      average_allocation = _predict_costs_for_media_units(
+        media=average_allocation,
+        channel_axis=0,
+        cost_models=cost_models,
+      )
     if media.ndim == 3:
       average_allocation = jnp.sum(average_allocation, axis=-1)
       optimal_allocation_per_timeunit = jnp.sum(
           optimal_allocation_per_timeunit, axis=-1)
+  else:
+    average_allocation = None
+    average_allocation_predictions = None
+    optimal_allocation_predictions = None
 
-  kpi_label = "KPI" if target_scaler else "Normalized KPI"
+  if response_metric == "cost_per_target":
+    predictions = media_ranges / predictions
+    if optimal_allocation_per_timeunit is not None:
+      average_allocation_predictions = average_allocation / average_allocation_predictions
+      optimal_allocation_predictions = optimal_allocation_per_timeunit / optimal_allocation_predictions
+    kpi_label = "CPA" if target_scaler else "Normalized CPA"
+  else:
+    kpi_label = "KPI" if target_scaler else "Normalized KPI"
+
   fig = plt.figure(media_mix_model.n_media_channels + 1,
                    figsize=figure_size,
                    tight_layout=True)
@@ -512,36 +693,39 @@ def plot_response_curves(# jax-ndarray
   last_ax = fig.add_subplot(n_rows, 1, n_rows)
   for i in range(media_mix_model.n_media_channels):
     ax = fig.add_subplot(n_rows, n_columns, i + 1)
-    sns.lineplot(
-        x=media_ranges[:, i],
-        y=predictions[:, i],
-        label=media_mix_model.media_names[i],
-        color=_PALETTE[i],
-        ax=ax)
-    sns.lineplot(
-        x=media_ranges[:, i],
-        y=jnp.log(predictions[:, i]) if apply_log_scale else predictions[:, i],
-        label=media_mix_model.media_names[i],
-        color=_PALETTE[i],
-        ax=last_ax)
-    if optimal_allocation_per_timeunit is not None:
-      ax.plot(
-          average_allocation[i],
-          average_allocation_predictions[i],
-          marker="o",
-          markersize=marker_size,
-          label="avg_spend",
-          color=_PALETTE[i])
-      ax.plot(
-          optimal_allocation_per_timeunit[i],
-          optimal_allocation_predictions[i],
-          marker="x",
-          markersize=marker_size + 2,
-          label="optimal_spend",
-          color=_PALETTE[i])
-    ax.set_ylabel(kpi_label)
-    ax.set_xlabel("Normalized Spend" if not media_scaler else "Spend")
-    ax.legend(fontsize=legend_fontsize)
+    # skip channels where we could not translate impressions to costs, because there were no
+    # non-zero values for one of the two in the input data.
+    if not should_skip_channel[i]:
+      sns.lineplot(
+          x=media_ranges[:, i],
+          y=predictions[:, i],
+          label=media_mix_model.media_names[i],
+          color=_PALETTE[i],
+          ax=ax)
+      sns.lineplot(
+          x=media_ranges[:, i],
+          y=jnp.log(predictions[:, i]) if apply_log_scale else predictions[:, i],
+          label=media_mix_model.media_names[i],
+          color=_PALETTE[i],
+          ax=last_ax)
+      if optimal_allocation_per_timeunit is not None:
+        ax.plot(
+            average_allocation[i],
+            average_allocation_predictions[i],
+            marker="o",
+            markersize=marker_size,
+            label="avg_spend",
+            color=_PALETTE[i])
+        ax.plot(
+            optimal_allocation_per_timeunit[i],
+            optimal_allocation_predictions[i],
+            marker="x",
+            markersize=marker_size + 2,
+            label="optimal_spend",
+            color=_PALETTE[i])
+      ax.set_ylabel(kpi_label)
+      ax.set_xlabel("Normalized Spend" if not media_scaler else "Spend")
+      ax.legend(fontsize=legend_fontsize)
 
   fig.suptitle("Response curves", fontsize=20)
   last_ax.set_ylabel(kpi_label if not apply_log_scale else f"log({kpi_label})")
@@ -619,7 +803,9 @@ def _create_shaded_line_plot(predictions: jnp.ndarray,
                              axis: matplotlib.axes.Axes,
                              title_prefix: str = "",
                              interval_mid_range: float = .9,
-                             digits: int = 3) -> None:
+                             digits: int = 3,
+                             target_is_log_scale: bool = False,
+                             ) -> None:
   """Creates a plot of ground truth, predicted value and credibility interval.
 
   Args:
@@ -641,8 +827,18 @@ def _create_shaded_line_plot(predictions: jnp.ndarray,
   lower_bound = jnp.quantile(a=predictions, q=lower_quantile, axis=0)
 
   r2, _ = arviz.r2_score(y_true=target, y_pred=predictions)
-  mape = 100 * metrics.mean_absolute_percentage_error(
-      y_true=target, y_pred=predictions.mean(axis=0))
+
+  if target_is_log_scale:
+    # if the target variable has been ln-scaled,
+    # un-scale with exp() before computing MAPE
+    mape = 100 * metrics.mean_absolute_percentage_error(
+        y_true=jnp.exp(target),
+        y_pred=jnp.exp(predictions).mean(axis=0)
+    )
+  else:
+    mape = 100 * metrics.mean_absolute_percentage_error(
+        y_true=target, y_pred=predictions.mean(axis=0))
+
   axis.plot(jnp.arange(target.shape[0]), target, c="grey", alpha=.9)
   axis.plot(
       jnp.arange(target.shape[0]),
@@ -673,6 +869,7 @@ def _call_fit_plotter(
     target: jnp.ndarray,
     interval_mid_range: float,
     digits: int,
+    target_is_log_scale: bool = False,
 ) -> matplotlib.figure.Figure:
   """Calls the shaded line plot once for national and N times for geo models.
 
@@ -697,14 +894,16 @@ def _call_fit_plotter(
                                axis=ax,
                                title_prefix=f"Geo {i}:",
                                interval_mid_range=interval_mid_range,
-                               digits=digits)
+                               digits=digits,
+                               target_is_log_scale=target_is_log_scale)
   else:  # Single plot for national model
     figure, ax = plt.subplots(1, 1)
     _create_shaded_line_plot(predictions=predictions,
                              target=target,
                              axis=ax,
                              interval_mid_range=interval_mid_range,
-                             digits=digits)
+                             digits=digits,
+                             target_is_log_scale=target_is_log_scale)
   return figure
 
 
@@ -741,11 +940,13 @@ def plot_model_fit(media_mix_model: lightweight_mmm.LightweightMMM,
       predictions=posterior_pred,
       target=target_train,
       interval_mid_range=interval_mid_range,
-      digits=digits)
+      digits=digits,
+      target_is_log_scale=media_mix_model._target_is_log_scale)
 
 
 def plot_out_of_sample_model_fit(out_of_sample_predictions: jnp.ndarray,
                                  out_of_sample_target: jnp.ndarray,
+                                 media_mix_model: lightweight_mmm.LightweightMMM = None,
                                  interval_mid_range: float = .9,
                                  digits: int = 3) -> matplotlib.figure.Figure:
   """Plots the ground truth, predicted value and interval for the test data.
@@ -763,11 +964,16 @@ def plot_out_of_sample_model_fit(out_of_sample_predictions: jnp.ndarray,
   Returns:
     Plot of model fit.
   """
+  target_is_log_scale = False
+  if media_mix_model is not None:
+    target_is_log_scale = media_mix_model._target_is_log_scale
+
   return _call_fit_plotter(
       predictions=out_of_sample_predictions,
       target=out_of_sample_target,
       interval_mid_range=interval_mid_range,
-      digits=digits)
+      digits=digits,
+      target_is_log_scale=target_is_log_scale)
 
 
 def plot_media_channel_posteriors(
@@ -832,7 +1038,8 @@ def plot_bars_media_metrics(
     metric: jnp.ndarray,
     metric_name: str = "metric",
     channel_names: Optional[Tuple[Any]] = None,
-    interval_mid_range: float = .9) -> matplotlib.figure.Figure:
+    interval_mid_range: float = .9,
+    bar_height: str = "mean") -> matplotlib.figure.Figure:
   """Plots a barchart of estimated media effects with their percentile interval.
 
   The lower and upper percentile need to be between 0-1.
@@ -845,40 +1052,52 @@ def plot_bars_media_metrics(
     channel_names: Names of media channels to be added to plot.
     interval_mid_range: Mid range interval to take for plotting. Eg. .9 will use
       .05 and .95 as the lower and upper quantiles. Must be a float number.
+    bar_height: "mean" to plot the mean as the bar height, "median" to plot the median
 
   Returns:
     Barplot of estimated media effects with defined percentile-bars.
   """
   if channel_names is None:
     channel_names = np.arange(np.shape(metric)[1])
+  if bar_height not in ["mean", "median"]:
+    raise ValueError("invalid bar_height")
   upper_quantile = 1 - (1 - interval_mid_range) / 2
   lower_quantile = (1 - interval_mid_range) / 2
 
   if metric.ndim == 3:
     metric = jnp.mean(metric, axis=-1)
 
+  if bar_height == "mean":
+    y_values = np.mean(metric, axis=0)
+  else:
+    y_values = np.median(metric, axis=0)
+
   fig, ax = plt.subplots(1, 1)
-  sns.barplot(data=metric, ci=None, ax=ax)
+  sns.barplot(data=metric, estimator=bar_height, errorbar=None, ax=ax)
+  for i in ax.containers:
+    ax.bar_label(i,)
+
   quantile_bounds = np.quantile(
       metric, q=[lower_quantile, upper_quantile], axis=0)
-  quantile_bounds[0] = abs(metric.mean(axis=0) - quantile_bounds[0])
-  quantile_bounds[1] = abs(quantile_bounds[1] - metric.mean(axis=0))
+  quantile_bounds[0] = y_values - quantile_bounds[0]
+  quantile_bounds[1] = quantile_bounds[1] - y_values
 
   ax.errorbar(
       x=np.arange(np.shape(metric)[1]),
-      y=metric.mean(axis=0),
-      yerr=quantile_bounds,
+      y=y_values,
+      yerr=np.where(quantile_bounds > 0., quantile_bounds, 0.),
       fmt="none",
       c="black",
   )
   ax.set_xticks(range(len(channel_names)))
   ax.set_xticklabels(
-      channel_names, rotation=60, ha="right", rotation_mode="anchor"
+      channel_names, rotation=45, ha="right", rotation_mode="anchor"
   )
   fig.suptitle(
-      f"Estimated media channel {metric_name}. \n Error bars show "
+      f"Estimated media channel {metric_name}.\nError bars show "
       f"{np.round(lower_quantile, 2)} - {np.round(upper_quantile, 2)} "
-      "credibility interval."
+      f"credibility interval.\nBar height shows the {bar_height} value.",
+      y=1.05
   )
   plt.close()
   return fig
@@ -1053,8 +1272,17 @@ def plot_media_baseline_contribution_area_plot(
   ax.set_ylabel("Baseline & Media Chanels Attribution")
   ax.set_xlabel("Period")
   ax.set_xlim(1, contribution_df_for_plot["period"].max())
-  ax.set_xticks(contribution_df_for_plot["period"])
-  ax.set_xticklabels(contribution_df_for_plot["period"])
+
+  # When there are more than 50 ticks on the X axis it becomes unreadable
+  if contribution_df_for_plot["period"].shape[0] < 50:
+    ticks = contribution_df_for_plot["period"]
+  else:
+    quantiles = [n * 0.02 for n in range(50)]
+    ticks = contribution_df_for_plot["period"].quantile(quantiles).round().astype(int)
+
+  ax.set_xticks(ticks)
+  ax.set_xticklabels(ticks)
+
   # Get handles and labels for sorting.
   handles, labels = ax.get_legend_handles_labels()
   # If true, legend_outside reversed the legend and puts the legend center left,
@@ -1213,6 +1441,7 @@ def _collect_features_for_prior_posterior_plot(
     channel_level_features: List of all channel-level features for the given
     model type.
     seasonal_features: List of all seasonal features for the given model type.
+    weekday_features: List of weekday features for the given model type.
     other_features: List of all other features for the given media_mix_model.
 
   Raises:
@@ -1272,13 +1501,13 @@ def _collect_features_for_prior_posterior_plot(
       "coef_media",
   ]
   seasonal_features = [models._GAMMA_SEASONALITY]
-  if media_mix_model._weekday_seasonality:
-    seasonal_features.append(models._WEEKDAY)
+  weekday_features = [models._WEEKDAY] if media_mix_model._weekday_seasonality else []
+
   other_features = list(set(features) - set(geo_level_features) -
-                        set(channel_level_features) - set(seasonal_features))
+                        set(channel_level_features) - set(seasonal_features) - set(weekday_features))
 
   return (list(features), geo_level_features, channel_level_features,
-          seasonal_features, other_features)
+          seasonal_features, weekday_features, other_features)
 
 
 def plot_prior_and_posterior(
@@ -1317,7 +1546,7 @@ def plot_prior_and_posterior(
     ValueError: A feature has been created without a well-defined prior.
   """
 
-  (features, geo_level_features, channel_level_features, seasonal_features,
+  (features, geo_level_features, channel_level_features, seasonal_features, weekday_features,
    other_features) = _collect_features_for_prior_posterior_plot(
        media_mix_model, selected_features)
 
@@ -1348,7 +1577,7 @@ def plot_prior_and_posterior(
 
   i_ax = 0
   for feature in (geo_level_features + channel_level_features +
-                  seasonal_features + other_features):
+                  seasonal_features + weekday_features + other_features):
     if feature not in features:
       continue
 
@@ -1426,6 +1655,19 @@ def plot_prior_and_posterior(
                subplot_title=subplot_title,
                i_ax=i_ax,
                **kwargs_for_helper_function)
+
+    if feature in weekday_features:
+        day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        for i_weekday in range(7):
+            subplot_title = f"{feature}, day {i_weekday} ({day_names[i_weekday]})"
+            posterior_samples = np.array(media_mix_model.trace[feature][:,
+                                                                        i_weekday])
+            (fig, gridspec_fig,
+             i_ax) = _make_prior_and_posterior_subplot_for_one_feature(
+                posterior_samples=posterior_samples,
+                subplot_title=subplot_title,
+                i_ax=i_ax,
+                **kwargs_for_helper_function)
 
     if feature in other_features and feature != models._COEF_EXTRA_FEATURES:
       subplot_title = f"{feature}"
