@@ -1,4 +1,4 @@
-# Copyright 2023 Fastrak, Inc.
+# Copyright 2024 Paramark, Inc.
 # Copyright 2023 Google LLC.
 #
 # Adapted from the original lightweight_mmm source, available at
@@ -144,6 +144,8 @@ class LightweightMMM:
     media_names: Names of the media channels passed at fitting time.
     custom_priors: The set of custom priors the model was trained with. An empty
       dictionary if none were passed.
+    baseline_positivity_constraint: If True, whether the baseline contribution
+      (intercept + trend + seasonality + extra predictors) is constrained to be positive. 
   """
   model_name: str = "hill_adstock"
   n_media_channels: int = dataclasses.field(init=False, repr=False)
@@ -156,6 +158,8 @@ class LightweightMMM:
       init=False, repr=False, hash=False, compare=False)
   custom_priors: MutableMapping[str, Prior] = dataclasses.field(
       init=False, repr=False, hash=False, compare=True)
+  baseline_positivity_constraint: bool = dataclasses.field(
+      init=False, repr=False, hash=False, compare=True, default=False)
   _degrees_seasonality: int = dataclasses.field(init=False, repr=False)
   _weekday_seasonality: bool = dataclasses.field(init=False, repr=False)
   _media_prior: jax.Array = dataclasses.field(
@@ -266,6 +270,7 @@ class LightweightMMM:
       target: jnp.ndarray,
       target_is_log_scale: Optional[bool] = False,
       extra_features: Optional[jnp.ndarray] = None,
+      baseline_positivity_constraint: bool = False,
       degrees_seasonality: int = 2,
       seasonality_frequency: int = 52,
       weekday_seasonality: bool = False,
@@ -292,6 +297,9 @@ class LightweightMMM:
       target: Target KPI to use, like for example sales.
       target_is_log_scale: True if target is log scale.  Used for reporting and plotting only.
       extra_features: Other variables to add to the model.
+      baseline_positivity_constraint: If True, enforce positivity constraint on the baseline,
+        which is the sum (intercept + trend + seasonality + extra predictors). Coefficients are not
+        constrained to be positive, and priors on coefficients do not need to be changed.
       degrees_seasonality: Number of degrees to use for seasonality. Default is
         2.
       seasonality_frequency: Frequency of the time period used. Default is 52 as
@@ -383,9 +391,11 @@ class LightweightMMM:
         frequency=seasonality_frequency,
         transform_function=self._model_transform_function,
         weekday_seasonality=weekday_seasonality,
-        custom_priors=custom_priors)
+        custom_priors=custom_priors,
+        baseline_positivity_constraint=baseline_positivity_constraint)
 
     self.custom_priors = custom_priors
+    self.baseline_positivity_constraint = baseline_positivity_constraint
     if media_names is not None:
       self.media_names = list(media_names)
     else:
@@ -418,19 +428,22 @@ class LightweightMMM:
       jax.jit,
       static_argnums=(0,),
       static_argnames=("degrees_seasonality", "weekday_seasonality",
-                       "transform_function", "model"))
+                       "transform_function", "model",
+                       "baseline_positivity_constraint"))
   def _predict(
       self,
       rng_key: jnp.ndarray,
       media_data: jnp.ndarray,
       extra_features: Optional[jnp.ndarray],
       media_prior: jnp.ndarray,
-      degrees_seasonality: int, frequency: int,
+      degrees_seasonality: int, 
+      frequency: int,
       transform_function: Callable[[Any], jnp.ndarray],
       weekday_seasonality: bool,
       model: Callable[[Any], None],
       posterior_samples: Dict[str, jnp.ndarray],
-      custom_priors: Dict[str, Prior]
+      custom_priors: Dict[str, Prior],
+      baseline_positivity_constraint: bool
       ) -> Dict[str, jnp.ndarray]:
     """Encapsulates the numpyro.infer.Predictive function for predict method.
 
@@ -465,7 +478,8 @@ class LightweightMMM:
             frequency=frequency,
             transform_function=transform_function,
             custom_priors=custom_priors,
-            weekday_seasonality=weekday_seasonality)
+            weekday_seasonality=weekday_seasonality,
+            baseline_positivity_constraint=baseline_positivity_constraint)
 
   def predict(
       self,
@@ -542,6 +556,7 @@ class LightweightMMM:
         transform_function=self._model_transform_function,
         model=self._model_function,
         custom_priors=self.custom_priors,
+        baseline_positivity_constraint=self.baseline_positivity_constraint,
         posterior_samples=self.trace)["mu"][:, previous_media.shape[0]:]
     if target_scaler:
       prediction = target_scaler.inverse_transform(prediction)
@@ -631,8 +646,12 @@ class LightweightMMM:
       unscaled_costs = jnp.einsum("cgs->scg", unscaled_costs)
 
     # get the scaled posterior prediction.
-    # posterior_pred has shape (samples, observations) and its value is the predicted total value of the target metric
-    # for that day / week.
+    # posterior_pred has dimensions:
+    #   0: samples
+    #   1: time
+    #   2: geo (geo models only)
+    #
+    # Its values are the predicted total value of the target metric for that day / week.
     posterior_pred = self.trace["mu"]
     if target_scaler:
       if self._target_is_log_scale:
